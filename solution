@@ -1,0 +1,103 @@
+All billing records still go into Cosmos DB (hot).
+An Azure Function monitors Cosmos DB for records older than 3 months. When triggered:Serializes and stores them in inexpensive Blob Storage Cool tier.Deletes them from Cosmos.
+If a read request misses in Cosmos, it checks Blob Storage transparently—fetching, deserializing, and returning the record (within seconds).
+
+archival >>>>>>>>>>>>>>>>>>>>
+
+ / detect_old.ts (TypeScript)
+import { CosmosClient, ChangeFeedProcessorFactory } from "@azure/cosmos";
+import { BlobServiceClient } from "@azure/storage-blob";
+
+const cosmos = new CosmosClient(...);
+const blobSvc = BlobServiceClient.fromConnectionString(process.env.BLOB_CONN);
+
+async function archiveAndDelete(record: any) {
+  const blob = blobSvc.getContainerClient("billing-archive")
+    .getBlockBlobClient(`${record.id}.json`);
+  await blob.upload(JSON.stringify(record), record._.size);
+  await cosmos.database("db").container("billing")
+    .item(record.id, record.pk).delete();
+}
+
+async function processChanges() {
+  const container = cosmos.database("db").container("billing");
+  const now = Date.now();
+  const processor = new ChangeFeedProcessorFactory(cosmos);
+  await processor.create(
+    "archiver",
+    container,
+    async (docs) => {
+      for (const rec of docs) {
+        const ts = new Date(rec.createdAt).getTime();
+        if (now - ts > 90*24*3600*1000) {
+          await archiveAndDelete(rec);
+        }
+      }
+    }
+  ).start();
+}
+
+processChanges().catch(console.error);
+
+
+Retrieval Function – fallback to archive >>>>>>>>>>>>>>>>>>>>>>>>>>
+
+
+
+// getBilling.ts
+import { CosmosClient } from "@azure/cosmos";
+import { BlobServiceClient } from "@azure/storage-blob";
+
+export async function getBilling(id: string, pk: string) {
+  const db = new CosmosClient(...).database("db").container("billing");
+  try {
+    const { resource } = await db.item(id, pk).read();
+    return resource;
+  } catch (e) {
+    if (e.code === 404) {
+      const blob = BlobServiceClient.fromConnectionString(...).getContainerClient("billing-archive").getBlobClient(`${id}.json`);
+      const resp = await blob.downloadToBuffer();
+      return JSON.parse(resp.toString());
+    } else throw e;
+  }
+}
+
+
+
+Deployment Commands (Azure CLI / ARM templates)  >>>>>>>>>>>>>>>>
+
+
+
+az storage container create \
+  --name billing-archive \
+  --connection-string $BLOB_CONN \
+  --output none
+
+az functionapp deployment source config-zip \
+  --resource-group RG \
+  --name billingFuncs \
+  --src ./archiver.zip
+
+
+
+
+
+ Repo Structure >>>>>>>>>>>>>>
+
+
+
+azure-billing-archival/
+├─ functions/
+│  ├─ archiver/
+│  │   ├─ index.ts
+│  │   └─ function.json
+│  └─ retriever/
+│      ├─ index.ts
+│      └─ function.json
+├─ infra/
+│  ├─ main.bicep
+│  └─ variables.json
+├─ scripts/
+│  ├─ deploy.ps1
+│  └─ archive-test.ps1
+└─ README.md
